@@ -1,0 +1,55 @@
+name: Build Chromium iOS IPA
+
+on:
+  workflow_dispatch:        # 手动触发
+  schedule:
+    - cron: '0 2 * * 0'    # 每周日凌晨 2 点跑一次（可选）
+
+jobs:
+  build:
+    runs-on: macos-14      # 必须 macOS 才能编 iOS
+
+    steps:
+      # 1. 准备环境
+      - name: Checkout builder repo
+        uses: actions/checkout@v4
+
+      - name: Setup depot_tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$PWD/depot_tools" >> $GITHUB_PATH
+
+      # 2. 拉取源码（浅克隆+子模块）
+      - name: Fetch Chromium
+        run: |
+          mkdir chromium && cd chromium
+          fetch --nohooks --no-history ios
+          gclient sync --nohooks --no-history
+
+      # 3. 生成构建配置
+      - name: Generate build files
+        run: |
+          cd chromium/src
+          gn gen out/ios_Release \
+            --args='target_os="ios" is_debug=false enable_ios_bitcode=false treat_warnings_as_errors=false'
+
+      # 4. 编译
+      - name: Ninja build
+        run: |
+          cd chromium/src
+          autoninja -C out/ios_Release ios_chrome
+
+      # 5. 打包 .app 为 .ipa
+      - name: Create unsigned IPA
+        run: |
+          cd chromium/src/out/ios_Release
+          mkdir -p Payload
+          cp -R ios_chrome.app Payload/
+          zip -r chromium-ios-unsigned.ipa Payload
+
+      # 6. 上传产物
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-ios-unsigned
+          path: chromium/src/out/ios_Release/chromium-ios-unsigned.ipa
