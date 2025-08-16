@@ -1,134 +1,84 @@
-name: Build Chromium iOS IPA (with sccache)
+name: Build Chromium iOS IPA
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 2 * * 0'   # 每周日凌晨 2 点跑一次
+    - cron: '0 2 * * 0'
 
 env:
-  # 让 depot_tools 也走 sccache
-  GYP_GENERATORS: ninja
-  CC_WRAPPER: sccache
-  # 配置 sccache 缓存目录、日志
   SCCACHE_DIR: ${{ github.workspace }}/sccache
-  SCCACHE_CACHE_SIZE: 5G
-  SCCACHE_LOG: debug
-  CACHE_KEY: chromium-ios-${{ runner.os }}-${{ github.run_number }}
-  # 让 gn 检测到 sccache
-  GN_EXTRA_ARGS: 'cc_wrapper="sccache"'
+  SCCACHE_CACHE_SIZE: 8G
 
 jobs:
   build:
-    runs-on: macos-14
-
+    runs-on: macos-14-large   # 150 GB SSD
     steps:
+      # 0. 取当前日期做 key
+      - name: Compute cache key
+        id: cache_key
+        run: echo "date=$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      # 1. 缓存 depot_tools
       - name: Cache depot_tools
         uses: actions/cache@v4
         with:
-          path: depot_tools
+          path: ~/depot_tools
           key: depot_tools-${{ runner.os }}-20240601
 
-      # 2. 缓存完整源码（包含 DEPS）
+      # 2. 缓存源码
       - name: Cache chromium src
-        id: cache_src
         uses: actions/cache@v4
         with:
           path: chromium
-          key: chromium-src-${{ hashFiles('chromium/.gclient') }}-${{ env.CACHE_KEY }}
-          restore-keys: |
-            chromium-src-
+          key: chromium-src-${{ steps.cache_key.outputs.date }}
+          restore-keys: chromium-src-
 
       # 3. 缓存 sccache
       - name: Cache sccache
         uses: actions/cache@v4
         with:
           path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ hashFiles('**/args.gn') }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
+          key: sccache-${{ runner.os }}-${{ steps.cache_key.outputs.date }}
 
-      # 4. 按需 clone / fetch
-      - name: Fetch Chromium (if cache miss)
-        if: steps.cache_src.outputs.cache-hit != 'true'
-        run: |
-          mkdir chromium && cd chromium
-          fetch --nohooks --no-history ios
-          gclient sync --nohooks --no-history
-      # 1. 取源码缓存 key
-      - name: Compute cache key
-        id: cache_key
-        run: echo "key=chromium-ios-$(date -u +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
-      # 2. 恢复 sccache
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.SCCACHE_DIR }}
-          key: sccache-${{ runner.os }}-${{ steps.cache_key.outputs.key }}
-          restore-keys: |
-            sccache-${{ runner.os }}-
-
-      # 3. 准备 depot_tools
-      - name: Checkout builder repo
-        uses: actions/checkout@v4
-
+      # 4. 安装工具
       - name: Setup depot_tools
         run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "$PWD/depot_tools" >> $GITHUB_PATH
+          if [ ! -d ~/depot_tools ]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git ~/depot_tools
+          fi
+          echo "$HOME/depot_tools" >> $GITHUB_PATH
 
-      # 4. 安装 sccache
       - name: Install sccache
-        run: |
-          brew install sccache
-          sccache --version
+        run: brew install sccache
 
-      # 5. 拉取源码（浅克隆）
+      # 5. 拉源码（仅缓存 miss）
       - name: Fetch Chromium
+        if: steps.cache-chromium.outputs.cache-hit != 'true'
         run: |
           mkdir chromium && cd chromium
           fetch --nohooks --no-history ios
           gclient sync --nohooks --no-history
 
-      # 6. 生成构建配置（带 sccache）
-      - name: Write args.gn
+      # 6. 官方一键 GN + 编译
+      - name: Setup GN
         run: |
           cd chromium/src
-          cat > out/ios_Release/args.gn <<'EOF'
-          target_os = "ios"
-          target_environment = device
-          is_debug = false
-          enable_ios_bitcode = false
-          treat_warnings_as_errors = false
-          cc_wrapper = "sccache"
-          EOF
+          ios/build/tools/setup-gn.py --target-device ios --configuration release
 
-      - name: Generate build files
-        run: |
-          cd chromium/src
-          gn gen out/ios_Release --args-file=out/ios_Release/args.gn
-
-      # 7. 真正开始编译
       - name: Ninja build
         run: |
           cd chromium/src
-          autoninja -C out/ios_Release ios_chrome
+          autoninja -C out/Release-iphoneos ios_chrome
 
-      # 8. 打包
-      - name: Create unsigned IPA
+      # 7. 打包 & 上传
+      - name: Package IPA
         run: |
-          cd chromium/src/out/ios_Release
+          cd chromium/src/out/Release-iphoneos
           mkdir -p Payload
           cp -R ios_chrome.app Payload/
           zip -r chromium-ios-unsigned.ipa Payload
 
-      # 9. 上传产物
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: chromium-ios-unsigned
-          path: chromium/src/out/ios_Release/chromium-ios-unsigned.ipa
-
-      # 10. 打印 sccache 命中率（可选）
-      - name: sccache stats
-        run: sccache --show-stats
+          name: ipa
+          path: chromium/src/out/Release-iphoneos/chromium-ios-unsigned.ipa
